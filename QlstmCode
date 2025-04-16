@@ -1,0 +1,141 @@
+QlstmCode:
+
+import tensorflow as tf
+import pennylane as qml
+from tensorflow.keras import layers, models
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Quantum Node definition
+dev = qml.device("default.qubit", wires=4)
+
+@qml.qnode(dev, interface="tf")
+def quantum_circuit(inputs):
+    # Normalize inputs to be in [0, π] range
+    inputs = tf.math.sigmoid(inputs) * np.pi
+    for i in range(4):
+        qml.RX(inputs[i], wires=i)
+    # Entangle the qubits
+    for i in range(3):
+        qml.CNOT(wires=[i, i+1])
+    return [qml.expval(qml.PauliZ(i)) for i in range(4)]
+
+# Quantum Feature Map Layer
+class QuantumFeatureMap(layers.Layer):
+    def __init__(self, output_dim, **kwargs):
+        super().__init__(**kwargs)
+        self.output_dim = output_dim
+
+    def build(self, input_shape):
+        self.kernel = self.add_weight(
+            shape=(input_shape[-1], self.output_dim),
+            initializer="glorot_uniform",
+            name="kernel",
+            trainable=True
+        )
+        self.built = True
+
+    def call(self, inputs):
+        projected = tf.matmul(inputs, self.kernel)
+        return tf.vectorized_map(quantum_circuit, projected)
+
+# Q-LSTM Layer
+class QLSTM(layers.Layer):
+    def __init__(self, units, **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+        self.quantum_feature_map = QuantumFeatureMap(output_dim=4)
+        self.lstm_cell = layers.LSTMCell(units)
+        self.dense = layers.Dense(1)  # Output 1 value for regression
+
+    def build(self, input_shape):
+        # Initialize any layer-specific weights or states here if needed
+        super().build(input_shape)  # Required for layer-building process
+
+    def call(self, inputs):
+        batch_size = tf.shape(inputs)[0]
+        timesteps = tf.shape(inputs)[1]
+
+        # Reshape for quantum processing
+        reshaped = tf.reshape(inputs, [-1, inputs.shape[-1]])
+        quantum_features = self.quantum_feature_map(reshaped)
+        quantum_features = tf.reshape(quantum_features, [batch_size, timesteps, -1])
+
+        # Initialize LSTM state without dtype argument
+        initial_state = self.lstm_cell.get_initial_state(batch_size=batch_size)
+        state = initial_state
+
+        # Process each timestep dynamically
+        outputs = []
+        for t in range(tf.shape(quantum_features)[1]):  # Using tf.shape to handle symbolic tensors
+            output, state = self.lstm_cell(quantum_features[:, t, :], state)
+            outputs.append(output)
+
+        # Stack outputs and apply final dense layer
+        lstm_output = tf.stack(outputs, axis=1)
+        return self.dense(lstm_output[:, -1, :])  # Return only last output
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"units": self.units})
+        return config
+
+# Build model
+model = models.Sequential([
+    layers.Input(shape=(X_train.shape[1], X_train.shape[2])),  # Use Input instead of InputLayer
+    QLSTM(units=64),
+    layers.Dense(1)
+])
+
+model.compile(optimizer='adam',
+              loss='mean_squared_error',
+              metrics=['mean_absolute_error'])
+
+# Training callback to print metrics at the end of each epoch
+class PrintMetrics(tf.keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        print(f"Epoch {epoch+1} - Loss: {logs['loss']:.4f}, MAE: {logs['mean_absolute_error']:.4f}, "
+              f"Val Loss: {logs['val_loss']:.4f}, Val MAE: {logs['val_mean_absolute_error']:.4f}")
+
+# Train the model
+history = model.fit(
+    X_train, y_train,
+    epochs=50,
+    batch_size=32,
+    validation_data=(X_test, y_test),
+    callbacks=[PrintMetrics()],
+    verbose=0
+)
+
+# Evaluation
+y_pred = model.predict(X_test)
+y_pred_rescaled = scaler.inverse_transform(y_pred)
+y_test_rescaled = scaler.inverse_transform(y_test.reshape(-1, 1))
+
+mae = mean_absolute_error(y_test_rescaled, y_pred_rescaled)
+mse = mean_squared_error(y_test_rescaled, y_pred_rescaled)
+rmse = np.sqrt(mse)
+
+print(f"\nFinal Test Metrics:")
+print(f"MAE: {mae:.4f}, MSE: {mse:.4f}, RMSE: {rmse:.4f}")
+
+# Plot results
+plt.figure(figsize=(12, 6))
+plt.plot(y_test_rescaled, label='Actual')
+plt.plot(y_pred_rescaled, label='Predicted', alpha=0.7)
+plt.title('Solar Radiation Prediction')
+plt.xlabel('Time Steps')
+plt.ylabel('Radiation')
+plt.legend()
+plt.show()
+
+# Save the new dataset with the forecasted values
+forecasted_data = pd.DataFrame({
+    'datetime': pd.date_range(start=solar_radiation_data['datetime'].iloc[-1], periods=25, freq='5T'),
+    'predicted_radiation': y_pred_rescaled.flatten()
+})
+
+# Save the forecasted data to CSV
+forecasted_data.to_csv('forecasted_solar_radiation.csv', index=False)
+
+'/content/forecasted_solar_radiation.csv'  # Path to the saved forecasted dataset
