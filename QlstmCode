@@ -484,6 +484,6 @@ forecast_df.to_csv('/content/forecasted_solar_radiation.csv', index=False)
 print("The forecasted solar radiation dataset has been saved as 'forecasted_solar_radiation.csv'. You can download it from the link below:")
 print("/mnt/data/forecasted_solar_radiation.csv")
 
-
+Last Modified code link: https://chatgpt.com/canvas/shared/680bcc73377c8191beb0a9279ce564c0
 
 
