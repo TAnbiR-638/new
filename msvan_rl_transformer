@@ -1,0 +1,708 @@
+Code:
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+import gymnasium as gym
+from gymnasium import spaces
+from stable_baselines3 import PPO
+import os
+import random
+import optuna
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.cuda.amp import GradScaler, autocast
+
+# Set seeds for reproducibility
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+set_seed(42)
+
+# 1. Enhanced Data Preprocessing
+print("Loading and preprocessing data...")
+df = pd.read_csv("solar_radiation.csv")
+df.columns = ["Index", "UnixTimestamp", "Date", "Time", "SolarRadiation"]
+df["Datetime"] = pd.to_datetime(df["Date"] + " " + df["Time"])
+df.sort_values("Datetime", inplace=True)
+df.set_index("Datetime", inplace=True)
+df = df[["SolarRadiation"]].resample("5min").mean().interpolate(method='time')
+
+# Feature Engineering
+df['Hour'] = df.index.hour
+df['Minute'] = df.index.minute
+df['DayOfWeek'] = df.index.dayofweek
+df['DayOfYear'] = df.index.dayofyear
+df['Weekend'] = (df.index.dayofweek >= 5).astype(int)
+df['TimeOfDay'] = df.index.hour + df.index.minute / 60
+
+# Create cyclic features
+df['Hour_sin'] = np.sin(2 * np.pi * df['Hour']/24)
+df['Hour_cos'] = np.cos(2 * np.pi * df['Hour']/24)
+df['Month_sin'] = np.sin(2 * np.pi * df.index.month/12)
+df['Month_cos'] = np.cos(2 * np.pi * df.index.month/12)
+
+# Feature scaling
+scaler = MinMaxScaler()
+features_to_scale = ['SolarRadiation', 'DayOfYear', 'TimeOfDay']
+df[features_to_scale] = scaler.fit_transform(df[features_to_scale])
+
+# Prepare data sequences
+def create_sequences(data, input_window, output_window):
+    X, y = [], []
+    total_window = input_window + output_window
+    for i in range(len(data) - total_window):
+        X.append(data[i:i+input_window])
+        y.append(data[i+input_window:i+total_window, 0])  # Only predict solar radiation
+    return np.array(X), np.array(y)
+
+# Calculate last 24 hours (288 data points at 5-min intervals)
+last_24h = 288
+all_data = df.values.astype(np.float32)
+train_data = all_data[:-last_24h]
+test_data = all_data[-last_24h:]
+
+print(f"Total data points: {len(all_data)}")
+print(f"Training data points: {len(train_data)}")
+print(f"Test data points (last date): {len(test_data)}")
+
+# 2. Enhanced Dataset Class
+class TimeSeriesDataset(Dataset):
+    def __init__(self, series, input_window, output_window):
+        self.X, self.y = create_sequences(series, input_window, output_window)
+        self.X = torch.tensor(self.X).float()
+        self.y = torch.tensor(self.y).float()
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+# 3. Improved Model Architecture
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1, stride=stride)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU()
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride),
+                nn.BatchNorm1d(out_channels)
+            )
+            
+    def forward(self, x):
+        identity = self.shortcut(x)
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += identity
+        out = self.relu(out)
+        return out
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, embed_size, heads):
+        super().__init__()
+        self.embed_size = embed_size
+        self.heads = heads
+        self.head_dim = embed_size // heads
+        
+        assert self.head_dim * heads == embed_size, "Embed size needs to be divisible by heads"
+        
+        self.values = nn.Linear(embed_size, embed_size)
+        self.keys = nn.Linear(embed_size, embed_size)
+        self.queries = nn.Linear(embed_size, embed_size)
+        self.fc_out = nn.Linear(embed_size, embed_size)
+        
+    def forward(self, values, keys, query, mask=None):
+        N = query.shape[0]
+        value_len, key_len, query_len = values.shape[1], keys.shape[1], query.shape[1]
+        
+        # Split embedding into self.heads pieces
+        values = self.values(values).view(N, value_len, self.heads, self.head_dim)
+        keys = self.keys(keys).view(N, key_len, self.heads, self.head_dim)
+        queries = self.queries(query).view(N, query_len, self.heads, self.head_dim)
+        
+        # Einsum does matrix mult for multiple heads
+        energy = torch.einsum("nqhd,nkhd->nhqk", [queries, keys])
+        
+        if mask is not None:
+            energy = energy.masked_fill(mask == 0, float("-1e20"))
+            
+        attention = torch.softmax(energy / (self.embed_size ** (1/2)), dim=3)
+        
+        out = torch.einsum("nhql,nlhd->nqhd", [attention, values]).reshape(
+            N, query_len, self.heads * self.head_dim
+        )
+        
+        out = self.fc_out(out)
+        return out
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_size, heads, dropout, forward_expansion):
+        super().__init__()
+        self.attention = MultiHeadAttention(embed_size, heads)
+        self.norm1 = nn.LayerNorm(embed_size)
+        self.norm2 = nn.LayerNorm(embed_size)
+        
+        self.feed_forward = nn.Sequential(
+            nn.Linear(embed_size, forward_expansion * embed_size),
+            nn.ReLU(),
+            nn.Linear(forward_expansion * embed_size, embed_size)
+        )
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, value, key, query, mask=None):
+        attention = self.attention(value, key, query, mask)
+        x = self.dropout(self.norm1(attention + query))
+        forward = self.feed_forward(x)
+        out = self.dropout(self.norm2(forward + x))
+        return out
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1), :]
+
+class EnhancedSolarModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_blocks=3, heads=8, dropout=0.1, forward_expansion=4):
+        super().__init__()
+        self.embedding = nn.Linear(input_dim, hidden_dim)
+        self.pos_encoder = PositionalEncoding(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+        # Residual convolutional blocks
+        self.res_blocks = nn.ModuleList([
+            ResidualBlock(hidden_dim, hidden_dim) for _ in range(num_blocks)
+        ])
+        
+        # Transformer blocks
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(hidden_dim, heads, dropout, forward_expansion) 
+            for _ in range(num_blocks)
+        ])
+        
+        # Bidirectional LSTM
+        self.bilstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True, bidirectional=True)
+        
+        # Output layers
+        self.fc1 = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        
+        # Attention mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),
+            nn.Softmax(dim=1)
+        )
+        
+        # Initialize weights
+        self._init_weights()
+        
+    def _init_weights(self):
+        for name, param in self.named_parameters():
+            if 'weight' in name:
+                if 'lstm' in name:
+                    nn.init.orthogonal_(param)
+                else:
+                    nn.init.xavier_uniform_(param)
+            elif 'bias' in name:
+                nn.init.constant_(param, 0.0)
+                
+    def forward(self, x):
+        # Input shape: (batch, seq_len, input_dim)
+        x = self.embedding(x)
+        x = self.pos_encoder(x)
+        x = self.dropout(x)
+        
+        # Permute for conv layers: (batch, channels, seq_len)
+        x = x.permute(0, 2, 1)
+        
+        # Residual blocks
+        for block in self.res_blocks:
+            x = block(x)
+        
+        # Permute back: (batch, seq_len, hidden_dim)
+        x = x.permute(0, 2, 1)
+        
+        # Transformer blocks
+        for block in self.transformer_blocks:
+            x = block(x, x, x)
+        
+        # Bidirectional LSTM
+        x, _ = self.bilstm(x)
+        
+        # Attention mechanism
+        attn_weights = self.attention(x)
+        x = torch.sum(attn_weights * x, dim=1)
+        
+        # Output layers
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+        
+        return x
+
+# 4. Hyperparameter Optimization with Optuna
+def objective(trial):
+    # Suggest hyperparameters
+    window_size = trial.suggest_categorical('window_size', [32, 64, 96, 128])
+    hidden_dim = trial.suggest_categorical('hidden_dim', [64, 128, 256])
+    num_blocks = trial.suggest_categorical('num_blocks', [2, 3, 4])
+    dropout = trial.suggest_float('dropout', 0.1, 0.5)
+    lr = trial.suggest_float('lr', 1e-5, 1e-3, log=True)
+    batch_size = trial.suggest_categorical('batch_size', [32, 64, 128])
+    
+    # Create dataset
+    output_window = last_24h
+    dataset = TimeSeriesDataset(train_data, window_size, output_window)
+    
+    # Split dataset
+    train_len = int(0.8 * len(dataset))
+    val_len = len(dataset) - train_len
+    train_ds, val_ds = random_split(dataset, [train_len, val_len])
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size)
+    
+    # Create model
+    model = EnhancedSolarModel(
+        input_dim=train_data.shape[1],
+        hidden_dim=hidden_dim,
+        output_dim=output_window,
+        num_blocks=num_blocks,
+        dropout=dropout
+    )
+    
+    # Optimizer and loss
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    criterion = nn.HuberLoss()
+    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5, verbose=False)
+    
+    # Training loop
+    best_val_loss = float('inf')
+    for epoch in range(30):  # Shorter training for optimization
+        # Training
+        model.train()
+        train_losses = []
+        for xb, yb in train_loader:
+            optimizer.zero_grad()
+            pred = model(xb)
+            loss = criterion(pred, yb)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            train_losses.append(loss.item())
+        
+        # Validation
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for xv, yv in val_loader:
+                pv = model(xv)
+                loss = criterion(pv, yv)
+                val_losses.append(loss.item())
+        
+        val_loss = np.mean(val_losses)
+        scheduler.step(val_loss)
+        
+        # Report intermediate result
+        trial.report(val_loss, epoch)
+        
+        # Handle pruning based on the intermediate value
+        if trial.should_prune():
+            raise optuna.TrialPruned()
+            
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+    
+    return best_val_loss
+
+# 5. Enhanced RL Environment for Training Optimization
+class TrainingOptimEnv(gym.Env):
+    def __init__(self, train_loader, val_loader, model, initial_lr=1e-3):
+        super().__init__()
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.model = model
+        self.initial_lr = initial_lr
+        
+        # Action space: adjust learning rate multiplier (log scale)
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        
+        # Observation space: 
+        # [0] current loss, [1] previous loss, [2] current lr, [3] epoch progress
+        self.observation_space = spaces.Box(low=0, high=10, shape=(4,), dtype=np.float32)
+        
+        self.optimizer = None
+        self.criterion = nn.HuberLoss()  # More robust loss
+        self.mae_criterion = nn.L1Loss()
+        self.current_epoch = 0
+        self.max_epochs = 100
+        self.best_loss = float('inf')
+        self.previous_loss = float('inf')
+        self.current_loss = float('inf')
+        self.current_mae = float('inf')
+        self.current_lr = initial_lr
+        self.scaler = GradScaler()  # For mixed precision training
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        # Reset model weights
+        for layer in self.model.children():
+            if hasattr(layer, 'reset_parameters'):
+                layer.reset_parameters()
+        
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.initial_lr, weight_decay=1e-4)
+        self.scheduler = ReduceLROnPlateau(self.optimizer, 'min', patience=3, factor=0.5)
+        self.current_epoch = 0
+        self.best_loss = float('inf')
+        self.previous_loss = float('inf')
+        self.current_loss = float('inf')
+        self.current_mae = float('inf')
+        self.current_lr = self.initial_lr
+        
+        # Initialize with a validation pass
+        self.model.eval()
+        with torch.no_grad():
+            val_losses = []
+            val_mae_losses = []
+            for xv, yv in self.val_loader:
+                pv = self.model(xv)
+                mse_loss = self.criterion(pv, yv)
+                mae_loss = self.mae_criterion(pv, yv)
+                val_losses.append(mse_loss.item())
+                val_mae_losses.append(mae_loss.item())
+            self.current_loss = np.mean(val_losses)
+            self.current_mae = np.mean(val_mae_losses)
+        
+        return self._get_obs(), {}
+
+    def _get_obs(self):
+        return np.array([
+            self.current_loss,
+            self.previous_loss,
+            self.current_lr,
+            self.current_epoch / self.max_epochs
+        ], dtype=np.float32)
+
+    def step(self, action):
+        # Action: change in log learning rate
+        lr_multiplier = 10 ** (action[0] * 0.5)  # Scale action to ±0.5 in log10 space
+        new_lr = self.current_lr * lr_multiplier
+        
+        # Clamp learning rate to reasonable bounds
+        new_lr = max(1e-6, min(1e-2, new_lr))
+        
+        # Update optimizer with new learning rate
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = new_lr
+        self.current_lr = new_lr
+        
+        # Perform training for one epoch with mixed precision
+        self.model.train()
+        train_losses = []
+        for xb, yb in self.train_loader:
+            self.optimizer.zero_grad()
+            
+            with autocast():
+                pred = self.model(xb)
+                loss = self.criterion(pred, yb)
+            
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            
+            train_losses.append(loss.item())
+        
+        # Validation pass
+        self.model.eval()
+        val_losses = []
+        val_mae_losses = []
+        with torch.no_grad():
+            for xv, yv in self.val_loader:
+                pv = self.model(xv)
+                mse_loss = self.criterion(pv, yv)
+                mae_loss = self.mae_criterion(pv, yv)
+                val_losses.append(mse_loss.item())
+                val_mae_losses.append(mae_loss.item())
+        
+        # Update loss history
+        self.previous_loss = self.current_loss
+        self.current_loss = np.mean(val_losses)
+        self.current_mae = np.mean(val_mae_losses)
+        
+        # Update scheduler
+        self.scheduler.step(self.current_loss)
+        
+        # Reward is negative of validation loss with bonus for improvement
+        reward = -self.current_loss
+        if self.current_loss < self.best_loss:
+            reward += 0.1  # Small bonus for improvement
+            self.best_loss = self.current_loss
+        
+        # Update epoch counter
+        self.current_epoch += 1
+        
+        # Check termination conditions
+        done = self.current_epoch >= self.max_epochs
+        truncated = False
+        
+        return self._get_obs(), reward, done, truncated, {
+            "epoch": self.current_epoch,
+            "lr": self.current_lr,
+            "val_mse": self.current_loss,
+            "val_rmse": np.sqrt(self.current_loss),
+            "val_mae": self.current_mae
+        }
+
+# 6. Enhanced Training Function with Hyperparameter Optimization
+def optimize_and_train(train_data, output_window):
+    # Hyperparameter optimization
+    study = optuna.create_study(direction='minimize', pruner=optuna.pruners.MedianPruner())
+    study.optimize(objective, n_trials=20, timeout=3600)  # 1 hour timeout
+    
+    print("Best hyperparameters:")
+    for key, value in study.best_params.items():
+        print(f"{key}: {value}")
+    
+    # Get best hyperparameters
+    best_params = study.best_params
+    window_size = best_params['window_size']
+    hidden_dim = best_params['hidden_dim']
+    num_blocks = best_params['num_blocks']
+    dropout = best_params['dropout']
+    lr = best_params['lr']
+    batch_size = best_params['batch_size']
+    
+    # Create dataset
+    dataset = TimeSeriesDataset(train_data, window_size, output_window)
+    
+    # Split into train and validation
+    train_len = int(0.8 * len(dataset))
+    val_len = len(dataset) - train_len
+    train_ds, val_ds = random_split(dataset, [train_len, val_len])
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size)
+    
+    # Create model with best hyperparameters
+    model = EnhancedSolarModel(
+        input_dim=train_data.shape[1],
+        hidden_dim=hidden_dim,
+        output_dim=output_window,
+        num_blocks=num_blocks,
+        dropout=dropout
+    )
+    
+    # Use RL to optimize the training process
+    print("\nStarting RL-optimized training...")
+    final_model, training_history = rl_optimized_train(
+        model, train_loader, val_loader, initial_lr=lr
+    )
+    
+    return final_model, training_history, window_size
+
+def rl_optimized_train(model, train_loader, val_loader, initial_lr=1e-3):
+    # Create RL environment
+    env = TrainingOptimEnv(train_loader, val_loader, model, initial_lr)
+    
+    # Create and train RL agent
+    rl_model = PPO('MlpPolicy', env, verbose=0, learning_rate=1e-3, 
+                  n_steps=64, batch_size=16, device='cpu')
+    rl_model.learn(total_timesteps=100)  # Train for 100 steps (1 step = 1 epoch)
+    
+    # Run optimized training
+    obs = env.reset()
+    done = False
+    training_history = []
+    
+    print("\nRL-Optimized Training Progress:")
+    print("Epoch | Learning Rate | Validation MSE | Validation RMSE | Validation MAE")
+    print("------|---------------|----------------|-----------------|----------------")
+    
+    while not done:
+        action, _ = rl_model.predict(obs, deterministic=True)
+        obs, reward, done, truncated, info = env.step(action)
+        
+        # Print detailed metrics
+        print(f"{info['epoch']:5d} | {info['lr']:.3e} | {info['val_mse']:.6f} | "
+              f"{info['val_rmse']:.6f} | {info['val_mae']:.6f}")
+        
+        training_history.append({
+            "epoch": info["epoch"],
+            "lr": info["lr"],
+            "val_mse": info["val_mse"],
+            "val_rmse": info["val_rmse"],
+            "val_mae": info["val_mae"]
+        })
+    
+    return model, training_history
+
+# 7. Final Prediction and Evaluation
+def make_final_prediction(model, train_data, test_data, window_size):
+    # Prepare input sequence (last 'window_size' points before test data)
+    test_start = len(train_data) - window_size
+    test_input = train_data[test_start:test_start+window_size]
+    test_input = torch.tensor(test_input).unsqueeze(0).float()
+
+    # Make prediction
+    model.eval()
+    with torch.no_grad():
+        prediction = model(test_input).numpy().flatten()
+    
+    # Inverse scaling for solar radiation
+    actual_solar = test_data[:, 0]  # First column is solar radiation
+    # Create a dummy array for inverse scaling
+    dummy = np.zeros((len(actual_solar), train_data.shape[1]))
+    dummy[:, 0] = actual_solar
+    actual_last_date = scaler.inverse_transform(dummy)[:, 0]
+    
+    dummy_pred = np.zeros((len(prediction), train_data.shape[1]))
+    dummy_pred[:, 0] = prediction
+    predicted_last_date = scaler.inverse_transform(dummy_pred)[:, 0]
+
+    # Calculate metrics
+    mse = mean_squared_error(actual_last_date, predicted_last_date)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(actual_last_date, predicted_last_date)
+    r2 = r2_score(actual_last_date, predicted_last_date)
+    accuracy = max(0, r2) * 100  # R² as percentage accuracy
+    
+    # Create time index
+    last_date = df.index[-last_24h:]
+    time_labels = [ts.strftime('%H:%M') for ts in last_date]
+    
+    return actual_last_date, predicted_last_date, time_labels, mse, rmse, mae, r2, accuracy
+
+# 8. Main Execution
+if __name__ == "__main__":
+    output_window = last_24h
+    
+    # Step 1: Optimize hyperparameters and train model
+    final_model, training_history, best_window_size = optimize_and_train(train_data, output_window)
+    
+    # Save training history with detailed metrics
+    history_df = pd.DataFrame(training_history)
+    history_df.to_csv("rl_optimized_training_history.csv", index=False)
+    print("\nTraining history saved to 'rl_optimized_training_history.csv'")
+    
+    # Plot learning rate and validation metrics during training
+    plt.figure(figsize=(16, 12))
+    
+    # Learning rate plot
+    plt.subplot(3, 1, 1)
+    plt.plot(history_df['epoch'], history_df['lr'], 'o-', color='#1f77b4')
+    plt.title('Learning Rate During RL-Optimized Training', fontsize=16)
+    plt.xlabel('Epoch', fontsize=14)
+    plt.ylabel('Learning Rate', fontsize=14)
+    plt.yscale('log')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Validation MSE plot
+    plt.subplot(3, 1, 2)
+    plt.plot(history_df['epoch'], history_df['val_mse'], 'o-', color='#2ca02c')
+    plt.title('Validation MSE During Training', fontsize=16)
+    plt.xlabel('Epoch', fontsize=14)
+    plt.ylabel('MSE', fontsize=14)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Validation MAE plot
+    plt.subplot(3, 1, 3)
+    plt.plot(history_df['epoch'], history_df['val_mae'], 'o-', color='#d62728')
+    plt.title('Validation MAE During Training', fontsize=16)
+    plt.xlabel('Epoch', fontsize=14)
+    plt.ylabel('MAE', fontsize=14)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    plt.tight_layout()
+    plt.savefig("rl_optimized_training_metrics.png", dpi=300)
+    plt.show()
+    
+    # Make final prediction on last date
+    actual, predicted, time_labels, mse, rmse, mae, r2, accuracy = make_final_prediction(
+        final_model, train_data, test_data, best_window_size
+    )
+    
+    # Create detailed prediction DataFrame
+    prediction_df = pd.DataFrame({
+        'Datetime': df.index[-last_24h:],
+        'Actual_Solar_Radiation': actual,
+        'Predicted_Solar_Radiation': predicted
+    })
+    
+    # Add time components for analysis
+    prediction_df['Hour'] = prediction_df['Datetime'].dt.hour
+    prediction_df['Minute'] = prediction_df['Datetime'].dt.minute
+    prediction_df['Time_Of_Day'] = prediction_df['Datetime'].dt.strftime('%H:%M')
+    
+    # Save predictions to CSV
+    prediction_df.to_csv("24_hour_forecast_5min_intervals.csv", index=False)
+    
+    # Print final metrics
+    print("\n" + "="*70)
+    print("Final Prediction Metrics for Last 24 Hours:")
+    print(f"MSE: {mse:.5f}")
+    print(f"RMSE: {rmse:.5f}")
+    print(f"MAE: {mae:.5f}")
+    print(f"R²: {r2:.4f}")
+    print(f"Accuracy: {accuracy:.2f}%")
+    print(f"Predictions saved to '24_hour_forecast_5min_intervals.csv' with 288 data points")
+    print("="*70)
+    
+    # Plot final forecast
+    plt.figure(figsize=(18, 8))
+    plt.plot(time_labels, actual, 'o-', color='#2ca02c', label="Actual Solar Radiation", 
+             linewidth=2, markersize=5, alpha=0.8)
+    plt.plot(time_labels, predicted, 's--', color='#d62728', label="Enhanced Model Forecast", 
+             linewidth=2, markersize=5, alpha=0.8)
+    plt.title(f"24-Hour Solar Radiation Forecast (Window Size = {best_window_size})", 
+              fontsize=16, pad=20)
+    plt.xlabel("Time of Day", fontsize=14)
+    plt.ylabel("Solar Radiation (W/m²)", fontsize=14)
+    plt.xticks(time_labels[::24], rotation=45)
+    plt.legend(fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.3)
+    
+    # Add metrics to plot
+    metrics_text = (f"MSE: {mse:.5f}\nRMSE: {rmse:.5f}\nMAE: {mae:.5f}\n"
+                   f"R²: {r2:.4f}\nAccuracy: {accuracy:.2f}%\n"
+                   f"Window Size: {best_window_size}")
+    plt.figtext(0.15, 0.7, metrics_text, bbox=dict(facecolor='white', alpha=0.7), 
+                fontsize=12, family='monospace')
+    
+    plt.tight_layout()
+    plt.savefig("final_24_hour_forecast.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+print("Process completed successfully!")
+
+
